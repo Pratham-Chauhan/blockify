@@ -19,8 +19,8 @@ Mandatory:
   - GTK+ 3
 
 Optional but highly recommended:
-  - Pulseaudio (allows muting Spotify instead of all system sound)
-  - Gstreamer1.0 (used to play music of your choice during muted ads. Requires pulseaudio.)
+  - PipeWire or Pulseaudio (allows muting Spotify instead of all system sound)
+  - Gstreamer1.0 (used to play music of your choice during muted ads. Requires PipeWire or pulseaudio.)
 
 Optional:
   - docopt (provides a command-line interface for blockify and blockify-ui)
@@ -88,8 +88,8 @@ If any of these statements are true for your configuration, ad detection will _n
 * Spotify is minimized to the system tray (task bar is fine)
 * Notifications are disabled in Spotify  
 
-Additionally, blockify makes use of pulseaudio sinks, allowing processes to be muted individually.    
-If you do not have/want pulseaudio, blockify will mute the system sound during commercials instead of just Spotify. The interlude music feature will not work as a consequence.
+Additionally, blockify makes use of PipeWire or pulseaudio sinks, allowing processes to be muted individually.    
+If you do not have/want PipeWire or pulseaudio, blockify will mute the system sound during commercials instead of just Spotify. The interlude music feature will not work as a consequence.
 
 ### Detection
 
