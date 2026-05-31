@@ -11,6 +11,15 @@ Options:
     -h, --help        Show this help text.
     --version         Show current version of blockify.
 """
+import json
+
+from blockify import interludeplayer
+from blockify import dbusclient
+from blockify import blocklist
+from gi import require_version
+require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib
+
 import logging
 import os
 import re
@@ -22,16 +31,18 @@ import time
 from blockify import util
 
 log = logging.getLogger("cli")
+# log.setLevel(logging.DEBUG)
 
-from gi import require_version
 
-require_version('Gtk', '3.0')
-from gi.repository import Gtk
-from gi.repository import GObject
+from enum import Enum
 
-from blockify import blocklist
-from blockify import dbusclient
-from blockify import interludeplayer
+
+class MuteMode(Enum):
+    AUTO = 0
+    FORCE_MUTE = 1
+    FORCE_UNMUTE = 2
+
+
 
 
 class Blockify(object):
@@ -69,12 +80,15 @@ class Blockify(object):
 
         self.initialize_mute_method()
 
-        self.initialize_pulse_unmuted_value()
+        if self.mutemethod == self.pulse_mute:
+            self.initialize_pulse_unmuted_value()
 
         # Only use interlude music if we use pulse sinks and the interlude playlist is non-empty.
         self.use_interlude_music = util.CONFIG["interlude"]["use_interlude_music"] and \
-                                   self.mutemethod == self.pulsesink_mute and \
-                                   self.player.max_index >= 0
+            self.mutemethod == self.pulsesink_mute and \
+            self.player.max_index >= 0
+
+        self.unmute_delay_timer = None
 
         log.info("Blockify initialized.")
 
@@ -132,7 +146,7 @@ class Blockify(object):
         except (OSError, subprocess.CalledProcessError):
             log.debug("Mute method is alsa or pulse without sinks.")
             log.info("No pulse sinks found, falling back to system mute via alsa/pulse.")
-            self.mutemethod = self.alsa_mute
+            self.mutemethod = self.pipewire_mute
 
     def install_locale(self):
         import locale
@@ -180,11 +194,12 @@ class Blockify(object):
                     break
 
     def initialize_channels(self):
+        ''' Return a list of all possible channels [Master, Speaker, Headphone] from amixer '''
         channel_list = ["Master"]
-        amixer_output = subprocess.check_output("amixer")
-        if "'Speaker',0" in amixer_output.decode("utf-8"):
+        amixer_output = subprocess.check_output("amixer", text=True)
+        if "'Speaker',0" in amixer_output:
             channel_list.append("Speaker")
-        if "'Headphone',0" in amixer_output.decode("utf-8"):
+        if "'Headphone',0" in amixer_output:
             channel_list.append("Headphone")
 
         return channel_list
@@ -208,9 +223,9 @@ class Blockify(object):
             if not self.suspend_blockify:
                 self.dbus.connect_to_spotify_dbus(None)
                 self.player.try_resume_spotify_playback(True)
-                log.warn("Spotify was restarted! Connecting now.")
+                log.warning("Spotify was restarted! Connecting now.")
             else:
-                log.warn("Spotify was closed!")
+                log.warning("Spotify was closed!")
 
         return True
 
@@ -221,14 +236,15 @@ class Blockify(object):
     def start(self):
         self.bind_signals()
         # Force unmute to properly initialize unmuted state
+        self.toggle_mute(MuteMode.FORCE_UNMUTE)
 
-        self.toggle_mute(2)
+        GLib.timeout_add(self.spotify_refresh_interval, self.refresh_spotify_process_state)
 
-        GObject.timeout_add(self.spotify_refresh_interval, self.refresh_spotify_process_state)
-        GObject.timeout_add(self.update_interval, self.update)
+        GLib.timeout_add(self.update_interval, self.update)
+
         if self.autoplay:
             # Delay autoplayback until self.spotify_is_playing was called at least once.
-            GObject.timeout_add(self.update_interval + 100, self.start_autoplay)
+            GLib.timeout_add(self.update_interval + 100, self.start_autoplay)
 
         log.info("Blockify started.")
 
@@ -249,9 +265,10 @@ class Blockify(object):
         return self.song_status == "Playing"
 
     def update(self):
-        """Main update routine, looped every self.update_interval milliseconds."""
+        """Main update callback function, run periodically."""
+        log.debug(f'call update(): {self.current_song}')
         if not self.suspend_blockify:
-            # Determine if a commercial is running and act accordingly.
+            # Determine if a ad is running and act accordingly.
             self.found = self.find_ad()
 
             self.adjust_interlude()
@@ -285,8 +302,11 @@ class Blockify(object):
         if self.autodetect and self.current_song and self.current_song_is_ad():
             if self.use_interlude_music and not self.player.temp_disable:
                 self.player.temp_disable = True
-                GObject.timeout_add(self.player.playback_delay, self.player.play_with_delay)
-            self.ad_found()
+                log.debug("--Adding one time function callback self.player.play_with_delay() at the delay {} ms.".format(self.player.playback_delay))
+                GLib.timeout_add(self.player.playback_delay, self.player.play_with_delay)
+
+            log.debug(f"Ad found: {repr(self.current_song)}")
+            self.force_mute_ad()
             return True
 
         # Check if the blockfile has changed.
@@ -296,32 +316,39 @@ class Blockify(object):
             log.debug("Failed reading blocklist timestamp: {}. Recovering.".format(e))
             self.blocklist.__init__()
             current_timestamp = self.blocklist.timestamp
+            
         if self.blocklist.timestamp != current_timestamp:
             log.info("Blockfile changed. Reloading.")
             self.blocklist.__init__()
 
         if self.blocklist.find(self.current_song):
-            self.ad_found()
+            # log.info('found current song in blocklist')
+            self.force_mute_ad()
             return True
 
-        # Unmute with a certain delay to avoid the last second
-        # of commercial you sometimes hear because it's unmuted too early.
-        GObject.timeout_add(self.unmute_delay, self.unmute_with_delay)
-
+        # Unmute with a certain delay to avoid the last second of commercial you sometimes hear because it's unmuted too early.
+        # GLib.timeout_add(self.unmute_delay, self.unmute_with_delay)
+        
+        # log.debug(f'self.found: {self.found} | current song is ad? {self.current_song_is_ad()} | self.current_song: {self.current_song}')
+        # if not self.found: # ad no longer playing
+        self.toggle_mute(MuteMode.AUTO)
+        
         return False
 
-    def ad_found(self):
-        # log.debug("Ad found: {0}".format(self.current_song))
-        self.toggle_mute(1)
+    def force_mute_ad(self):
+        '''Force mute the ad with the configured mute method'''
+        self.toggle_mute(MuteMode.FORCE_MUTE)
 
     def unmute_with_delay(self):
+        log.debug(f">>>Unmuting with delay. is it ad? {self.found}")
+        
         if not self.found:
             self.toggle_mute()
         return False
 
     # Audio ads typically have no artist information (via DBus) and/or "/ad/" in their spotify url.
     # Video ads have no DBus information whatsoever so they are determined via window title (wmctrl).
-    def current_song_is_ad(self):
+    def current_song_is_ad(self) -> bool:
 
         missing_artist = self.current_song_title and not self.current_song_artist
         has_ad_url = "/ad/" in self.dbus.get_spotify_url()
@@ -339,6 +366,7 @@ class Blockify(object):
         return missing_artist or has_ad_url or title_mismatch
 
     def update_current_song_info(self):
+        ''' get song artist and title from dbus and update current song '''
         self.current_song_artist = self.dbus.get_song_artist()
         self.current_song_title = self.dbus.get_song_title()
         self.current_song = self.current_song_artist + self.song_delimiter + self.current_song_title
@@ -371,52 +399,96 @@ class Blockify(object):
             else:
                 log.error("Not found in blocklist or block pattern too short.")
 
-    def toggle_mute(self, mode=0):
-        # 0 = automatic, 1 = force mute, 2 = force unmute
+    def toggle_mute(self, mode: MuteMode = MuteMode.AUTO):
         self.mutemethod(mode)
 
-    def is_muted(self):
+    def is_muted(self):      
+        ''' check if any audio channel is muted (i.e volume is 0%) '''  
         for channel in self.channels:
             try:
-                output = subprocess.check_output(["amixer", "get", channel])
-                if "[off]" in output.decode("utf-8"):
+                output = subprocess.check_output(["amixer", "get", channel],  text=True, stderr=subprocess.DEVNULL)
+                if "off" in output:
                     return True
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
         return False
 
-    def get_state(self, mode):
+    def get_state(self, mode: MuteMode):
         muted = self.is_muted()
         self.is_fully_muted = muted
 
-        state = None
+        if muted: # audio is fully muted
+            if mode in (MuteMode.AUTO, MuteMode.FORCE_UNMUTE) or not self.current_song:
+                log.info(f"Unmuting: {self.current_song}")
+                return "unmute"
 
-        if muted and (mode == 2 or not self.current_song):
-            state = "unmute"
-        elif muted and mode == 0:
-            state = "unmute"
-            log.info("Unmuting.")
-        elif not muted and mode == 1:
-            state = "mute"
-            log.info("Muting {}.".format(self.current_song))
+        elif mode == MuteMode.FORCE_MUTE:
+            log.info(f"Muting: {self.current_song}", )
+            return "mute"
 
-        return state
+        return None
 
-    def alsa_mute(self, mode):
+    def alsa_mute(self, mode: MuteMode):
         """Mute method for systems without Pulseaudio. Mutes sound system-wide."""
         state = self.get_state(mode)
+        
         if not state:
+            log.info('State is None.')
             return
-
+        
+        log.debug(f"Executing: amixer -q set {state}, channels: {self.channels}")
         self.update_audio_channel_state(["amixer", "-q", "set"], state)
 
-    def pulse_mute(self, mode):
+    def pulse_mute(self, mode: MuteMode):
         """Used if pulseaudio is installed but no sinks are found. System-wide."""
         state = self.get_state(mode)
         if not state:
             return
 
         self.update_audio_channel_state(["amixer", "-qD", "pulse", "set"], state)
+
+
+    def extract_sink_status(self, pactl_out):   
+        index = ""
+        for sink in pactl_out:
+            sink_index = sink.get('index')
+            mute = sink.get('mute')
+            
+            props  = sink.get('properties', {})
+            app_name = props.get('application.name', '')
+            if app_name == 'spotify':
+                index = sink_index
+                return (index, mute)
+        
+        return (None, None)
+
+    def pipewire_mute(self, mode: MuteMode):
+        try:
+            pactl_out = subprocess.check_output(["pactl", "-f", "json", "list", "sink-inputs"], text=True) 
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            log.error("Failed to get pactl output. is pipewire running? Resorting to alsa as mute method.")
+            self.mutemethod = self.alsa_mute # Fall back to alsa mute.
+            self.use_interlude_music = False
+            return 
+        
+        sink_inputs = json.loads(pactl_out)
+
+        index, muted_value = self.extract_sink_status(sink_inputs)
+        self.is_sink_muted = muted_value
+
+        if index:
+            if self.is_sink_muted and (mode == MuteMode.FORCE_UNMUTE or not self.current_song):
+                log.info("Forcing unmute.")
+                subprocess.run(["pactl", "set-sink-input-mute", str(index), "0"])
+
+            elif not self.is_sink_muted and mode == MuteMode.FORCE_MUTE:
+                log.info("Muting {}.".format(self.current_song))
+                subprocess.run(["pactl", "set-sink-input-mute", str(index), "1"])
+
+            elif self.is_sink_muted and mode == MuteMode.AUTO:
+                log.info("Unmuting.")
+                subprocess.run(["pactl", "set-sink-input-mute", str(index), "0"])
+
 
     def update_audio_channel_state(self, command, state):
         for channel in self.channels:
@@ -446,7 +518,7 @@ class Blockify(object):
 
         return sink_status
 
-    def pulsesink_mute(self, mode):
+    def pulsesink_mute(self, mode: MuteMode):
         """Finds spotify's audio sink and toggles its mute state."""
         try:
             pacmd_out = subprocess.check_output(["pacmd", "list-sink-inputs"])
@@ -457,17 +529,18 @@ class Blockify(object):
             return
 
         index, playback_state, muted_value = self.extract_pulse_sink_status(pacmd_out)
+
         self.song_status = "Playing" if playback_state == "RUNNING" else "Paused"
         self.is_sink_muted = False if muted_value == self.pulse_unmuted_value else True
 
         if index:
-            if self.is_sink_muted and (mode == 2 or not self.current_song):
+            if self.is_sink_muted and (mode == MuteMode.FORCE_UNMUTE or not self.current_song):
                 log.info("Forcing unmute.")
                 subprocess.call(["pacmd", "set-sink-input-mute", index, "0"])
-            elif not self.is_sink_muted and mode == 1:
+            elif not self.is_sink_muted and mode == MuteMode.FORCE_MUTE:
                 log.info("Muting {}.".format(self.current_song))
                 subprocess.call(["pacmd", "set-sink-input-mute", index, "1"])
-            elif self.is_sink_muted and not mode:
+            elif self.is_sink_muted and mode == MuteMode.AUTO:
                 log.info("Unmuting.")
                 subprocess.call(["pacmd", "set-sink-input-mute", index, "0"])
 
@@ -551,7 +624,7 @@ class Blockify(object):
         if self.blocklist != self.orglist:
             self.blocklist.save()
         # Unmute before exiting.
-        self.toggle_mute(2)
+        self.toggle_mute(MuteMode.FORCE_UNMUTE)
 
     def stop(self):
         self.prepare_stop()
@@ -604,6 +677,6 @@ def main():
     cli = initialize()
     cli.start()
 
+
 if __name__ == "__main__":
     main()
-
